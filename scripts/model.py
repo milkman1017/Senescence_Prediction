@@ -34,147 +34,208 @@ def parse_args():
     return parser.parse_args()
 
 def load_data(args):
+    """
+    Load the CSV, engineer features, split into pre-2024 and 2024,
+    and build rolling windows for the model.
+    """
     df = pd.read_csv(args.file_path)
     df.columns = df.columns.str.strip()
 
+    # Drop exact duplicates based on key identifying columns
     df = df.drop_duplicates(
         subset=['Site', 'Src', 'Plot', 'Ind', 'Yrm', 'Tcode', 'gr', 'yday'],
         keep='first'
     )
 
-    # Define latitude and longitude mappings
+    # ------------------------------------------------------------------
+    # Static lat/long encodings for Site and Src
+    # ------------------------------------------------------------------
     lat_long = {
-        'Toolik': (68.623, -149.606),
-        'TL': (68.623, -149.606),
-        'Coldfoot': (67.25, -150.175),
-        'CF': (67.25, -150.175),
-        'Sagwon': (69.373, -148.700),
-        'SG': (69.373, -148.700)
+        'Toolik':   (68.623, -149.606),
+        'TL':       (68.623, -149.606),
+        'Coldfoot': (67.25,  -150.175),
+        'CF':       (67.25,  -150.175),
+        'Sagwon':   (69.373, -148.700),
+        'SG':       (69.373, -148.700),
     }
 
     if 'Site' in args.static_columns:
-        df['Site_lat'] = df['Site'].map(lambda x: lat_long.get(x, (0, 0))[0])
+        df['Site_lat']  = df['Site'].map(lambda x: lat_long.get(x, (0, 0))[0])
         df['Site_long'] = df['Site'].map(lambda x: lat_long.get(x, (0, 0))[1])
         args.static_columns.remove('Site')
         args.static_columns.extend(['Site_lat', 'Site_long'])
 
     if 'Src' in args.static_columns:
-        df['Src_lat'] = df['Src'].map(lambda x: lat_long.get(x, (0, 0))[0])
+        df['Src_lat']  = df['Src'].map(lambda x: lat_long.get(x, (0, 0))[0])
         df['Src_long'] = df['Src'].map(lambda x: lat_long.get(x, (0, 0))[1])
         args.static_columns.remove('Src')
         args.static_columns.extend(['Src_lat', 'Src_long'])
 
+    # ------------------------------------------------------------------
+    # Ensure Yrm is string and split pre-2024 vs 2024
+    # ------------------------------------------------------------------
     if 'Yrm' in df.columns:
         df['Yrm'] = df['Yrm'].astype(str)
 
-    df_2024 = df[df['Yrm'].str.startswith('2024')] if 'Yrm' in df.columns else pd.DataFrame()
-    df_train = df[~df['Yrm'].str.startswith('2024')] if 'Yrm' in df.columns else df
+    if 'Yrm' in df.columns:
+        df_2024 = df[df['Yrm'].str.startswith('2024')].copy()
+        df_train = df[~df['Yrm'].str.startswith('2024')].copy()
+    else:
+        df_2024 = pd.DataFrame()
+        df_train = df.copy()
 
+    # Optional row subsampling for quick tests
     if args.subset_size:
         df_train = df_train.head(args.subset_size)
         if not df_2024.empty:
             df_2024 = df_2024.head(args.subset_size)
 
+    # ------------------------------------------------------------------
+    # Target presence check
+    # ------------------------------------------------------------------
     if 'days_until_senescence' not in df.columns:
         raise ValueError("Missing target column 'days_until_senescence'")
 
-    missing_columns = [col for col in args.weather_columns + args.static_columns if col not in df.columns]
-    if missing_columns:
-        raise KeyError(f"Missing columns: {missing_columns}")
-    
-    if 'doy' in args.weather_columns:
-        doy_col = 'yday' if 'yday' in df.columns else ('doy' if 'doy' in df.columns else None)
-        if doy_col is None:
-            raise KeyError("Expected a day-of-year column named 'yday' (or 'doy'), but it was not found.")
+    # ------------------------------------------------------------------
+    # Day-of-year cyclical encoding: use only sin/cos, no raw doy/yday
+    # ------------------------------------------------------------------
+    # Determine which column in the data holds day-of-year
+    doy_source_col = None
+    for cand in ['yday', 'doy']:
+        if cand in df.columns:
+            doy_source_col = cand
+            break
 
-        # Use 365.25 to be robust across leap years without special-casing
+    # Did the user ask to use a day-of-year feature?
+    wants_doy = any(
+        c in (args.weather_columns + args.static_columns)
+        for c in ['doy', 'yday']
+    )
+
+    if doy_source_col is not None and wants_doy:
         tau = 2 * np.pi
-        phase = (df[doy_col].astype(float) % 365.25) / 365.25
+
+        # Full DF
+        phase = (df[doy_source_col].astype(float) % 365.25) / 365.25
         df['doy_sin'] = np.sin(tau * phase)
         df['doy_cos'] = np.cos(tau * phase)
 
-        # If we split out df_2024 and df_train above, mirror the new columns there too
+        # Train subset
+        phase_train = (df_train[doy_source_col].astype(float) % 365.25) / 365.25
+        df_train['doy_sin'] = np.sin(tau * phase_train)
+        df_train['doy_cos'] = np.cos(tau * phase_train)
+
+        # 2024 subset (if present)
         if not df_2024.empty:
-            phase_2024 = (df_2024[doy_col].astype(float) % 365.25) / 365.25
+            phase_2024 = (df_2024[doy_source_col].astype(float) % 365.25) / 365.25
             df_2024['doy_sin'] = np.sin(tau * phase_2024)
             df_2024['doy_cos'] = np.cos(tau * phase_2024)
 
-        if 'yday' in df_train.columns:
-            phase_train = (df_train[doy_col].astype(float) % 365.25) / 365.25
-            df_train['doy_sin'] = np.sin(tau * phase_train)
-            df_train['doy_cos'] = np.cos(tau * phase_train)
-
-        # Make sure the model uses doy_sin/doy_cos instead of raw yday/doy
+        # Remove raw doy / yday from both feature lists
         for col_list_name in ['weather_columns', 'static_columns']:
             col_list = getattr(args, col_list_name)
-            if doy_col in col_list:
-                col_list.remove(doy_col)
-                # Put the cyclical features into the weather path (time-varying)
-                # If you truly wanted them static, you could add to static instead.
-                if col_list_name != 'weather_columns':
-                    # move them to weather_columns if they weren't there
-                    if 'doy_sin' not in args.weather_columns: args.weather_cFolumns.append('doy_sin')
-                    if 'doy_cos' not in args.weather_columns: args.weather_columns.append('doy_cos')
-                else:
-                    # already in weather list
-                    if 'doy_sin' not in col_list: col_list.append('doy_sin')
-                    if 'doy_cos' not in col_list: col_list.append('doy_cos')
+            for alias in ['doy', 'yday']:
+                if alias in col_list:
+                    col_list.remove(alias)
 
-        # Safety: if user didn’t list yday in either list, still add cyclical features to weather inputs
+        # Ensure sin/cos are in weather_columns (time-varying)
         if 'doy_sin' not in args.weather_columns:
-            args.weather_columns += ['doy_sin', 'doy_cos']
+            args.weather_columns.extend(['doy_sin', 'doy_cos'])
 
-    categorical_encoders, categorical_decoders = {}, {}
+    # ------------------------------------------------------------------
+    # Now that feature lists are final, check that all columns exist
+    # ------------------------------------------------------------------
+    missing_columns = [
+        col for col in (args.weather_columns + args.static_columns)
+        if col not in df.columns
+    ]
+    if missing_columns:
+        raise KeyError(f"Missing columns: {missing_columns}")
+
+    # ------------------------------------------------------------------
+    # Categorical encoders for static columns (fit on train only)
+    # ------------------------------------------------------------------
+    categorical_encoders = {}
+    categorical_decoders = {}
+
     for col in args.static_columns:
-        if df[col].dtype in ['object', 'string']:
-            encoder = LabelEncoder()
-            df[col] = encoder.fit_transform(df[col])
-            categorical_encoders[col] = encoder
-            categorical_decoders[col] = dict(zip(encoder.transform(encoder.classes_), encoder.classes_))
-            if not df_2024.empty:
-                df_2024[col] = df_2024[col].map(lambda x: encoder.transform([x])[0] if x in encoder.classes_ else -1)
-            df_train[col] = encoder.transform(df_train[col])
+        if col in df_train.columns and df_train[col].dtype in ['object', 'string']:
+            enc = LabelEncoder()
+            # Fit on pre-2024 training data only
+            df_train[col] = enc.fit_transform(df_train[col].astype(str))
 
+            # Map 2024 data through encoder, unseen values -> -1
+            if not df_2024.empty and col in df_2024.columns:
+                df_2024[col] = df_2024[col].astype(str).map(
+                    lambda x: enc.transform([x])[0] if x in enc.classes_ else -1
+                )
+
+            categorical_encoders[col] = enc
+            categorical_decoders[col] = dict(
+                zip(enc.transform(enc.classes_), enc.classes_)
+            )
+
+    # ------------------------------------------------------------------
+    # Window creation helper
+    # ------------------------------------------------------------------
     def create_windows(data):
         windows, labels, statics, years, groups = [], [], [], [], []
-        grouping_cols = [col for col in args.static_columns if col not in ['Site_lat', 'Site_long']]
+
+        # For grouping into individuals, ignore lat/long (they're engineered)
+        grouping_cols = [c for c in args.static_columns
+                         if c not in ['Site_lat', 'Site_long']]
         grouping_cols.extend(['Plot', 'Ind', 'Yrm', 'Tcode', 'gr'])
-        grouping_cols = list(dict.fromkeys(grouping_cols))
+        grouping_cols = list(dict.fromkeys(grouping_cols))  # deduplicate
 
         relevant_cols = [
-            c for c in (args.weather_columns + args.static_columns + ['days_until_senescence'])
+            c for c in (args.weather_columns + args.static_columns +
+                        ['days_until_senescence'])
             if c in data.columns
         ]
 
         grouped = data.groupby(grouping_cols, sort=False)
         for key, g in grouped:
             g = g.sort_values('yday').reset_index(drop=True)
-            for i in range(0, len(g) - args.time_interval + 1, args.stride):
-                window = g.iloc[i:i+args.time_interval].copy()
 
-                # keep the NaN filter you added earlier here
+            for i in range(0, len(g) - args.time_interval + 1, args.stride):
+                window = g.iloc[i:i + args.time_interval].copy()
+
+                # Skip windows with any NaNs in relevant columns
                 if window[relevant_cols].isna().any().any():
                     continue
 
                 windows.append(window)
                 labels.append(window['days_until_senescence'].iloc[-1])
-                statics.append(window.iloc[-1][args.static_columns].astype(float).values)
+                statics.append(
+                    window.iloc[-1][args.static_columns].astype(float).values
+                )
                 years.append(int(window['Yrm'].iloc[-1]))
                 groups.append("_".join(map(str, key)))
 
-        return windows, np.array(labels), np.array(statics), np.array(years), np.array(groups)
+        return (
+            windows,
+            np.array(labels),
+            np.array(statics),
+            np.array(years),
+            np.array(groups),
+        )
 
+    # Build windows for pre-2024 and for 2024 holdout
+    train_windows, train_labels, train_static, train_years, train_groups = \
+        create_windows(df_train)
 
-    train_windows, train_labels, train_static, train_years, train_groups = create_windows(df_train)
-    val_2024_windows, val_2024_labels, val_2024_static, val_2024_years, val_2024_groups = (
-        create_windows(df_2024) if not df_2024.empty else ([], np.array([]), np.array([]), np.array([]), np.array([]))
+    if not df_2024.empty:
+        val_2024_windows, val_2024_labels, val_2024_static, val_2024_years, val_2024_groups = \
+            create_windows(df_2024)
+    else:
+        val_2024_windows, val_2024_labels, val_2024_static, val_2024_years, val_2024_groups = \
+            [], np.array([]), np.array([]), np.array([]), np.array([])
+
+    return (
+        (train_windows, train_labels, train_static, train_years, train_groups),
+        (val_2024_windows, val_2024_labels, val_2024_static, val_2024_years, val_2024_groups),
+        (categorical_encoders, categorical_decoders),
     )
-
-    return (train_windows, train_labels, train_static, train_years, train_groups), \
-           (val_2024_windows, val_2024_labels, val_2024_static, val_2024_years, val_2024_groups), \
-           (categorical_encoders, categorical_decoders)
-
-
 
 def split_and_scale(X_weather, X_static, y, years, groups, holdout_year=2024):
     """Returns scaled train/val + raw holdout, plus fitted scalers and indices."""
@@ -206,82 +267,121 @@ def split_and_scale(X_weather, X_static, y, years, groups, holdout_year=2024):
 
 
 def build_model(weather_input_shape, static_input_shape):
+    """
+    New architecture:
+      - Weather: 2x LSTM -> BN -> self-attention -> pooling (max + mean)
+      - Static: small MLP, heavy dropout + L2, then scaled down
+      - Fusion: concat(weather_repr, scaled_static) -> dense head
+      - Output: main_head + weather-only residual head
+    """
+
     # ─── Inputs ───────────────────────────────────────────────
     weather_input = Input(shape=weather_input_shape, name="weather_input")  # (B, T, Fw)
     static_input  = Input(shape=static_input_shape,  name="static_input")   # (B, Fs)
 
-    # ─── Weather Path (Uni-LSTM → Uni-LSTM → BN → Self-Attn) ─
+    # ─── Weather Path (LSTM → LSTM → BN → Self-Attn) ─────────
     x = LSTM(
-        128, return_sequences=True, recurrent_dropout=0.15,
-        kernel_regularizer=regularizers.l2(1e-4), name="lstm_1"
+        128,
+        return_sequences=True,
+        recurrent_dropout=0.15,
+        kernel_regularizer=regularizers.l2(1e-4),
+        name="lstm_1",
     )(weather_input)
 
     x = LSTM(
-        128, return_sequences=True, recurrent_dropout=0.15,
-        kernel_regularizer=regularizers.l2(1e-4), name="lstm_2"
+        64,
+        return_sequences=True,
+        recurrent_dropout=0.15,
+        kernel_regularizer=regularizers.l2(1e-4),
+        name="lstm_2",
     )(x)
 
     x = BatchNormalization(name="weather_bn")(x)
 
-    # Self-attention over time (set causal if you care about strict forecasting)
-    x_att = MultiHeadAttention(num_heads=8, key_dim=32, name="self_attention")(
-        x, x, use_causal_mask=False
-    )
+    # Self-attention over time (non-causal; we're using all T days)
+    x_att = MultiHeadAttention(
+        num_heads=4,
+        key_dim=32,
+        name="self_attention",
+    )(x, x, use_causal_mask=False)
+
     x = Add(name="attn_residual")([x, x_att])
     x = LayerNormalization(name="attn_norm")(x)
 
-    # ─── Static Path ──────────────────────────────────────────
-    s = Dense(
-        8, activation="relu",
-        kernel_regularizer=regularizers.l2(1e-3),
-        bias_regularizer=regularizers.l2(1e-3),
-        name="static_dense1"
-    )(static_input)
-    s = BatchNormalization(name="static_bn1")(s)
-    s = Dropout(0.6, name="static_drop1")(s)
+    # Pool over time: max + mean
+    x_max  = GlobalMaxPooling1D(name="time_max")(x)          # (B, D)
+    x_mean = GlobalAveragePooling1D(name="time_mean")(x)     # (B, D)
+    weather_repr = Concatenate(name="weather_pool_concat")([x_max, x_mean])
+
+    # ─── Static Path (small, heavily regularized) ────────────
+    s = BatchNormalization(name="static_bn_in")(static_input)
 
     s = Dense(
-        4, activation="relu",
-        kernel_regularizer=regularizers.l2(1e-3),
-        bias_regularizer=regularizers.l2(1e-3),
-        name="static_dense2"
+        16,
+        activation="relu",
+        kernel_regularizer=regularizers.l2(5e-3),
+        bias_regularizer=regularizers.l2(5e-3),
+        name="static_dense1",
+    )(s)
+    s = BatchNormalization(name="static_bn1")(s)
+    s = Dropout(0.7, name="static_drop1")(s)
+
+    s = Dense(
+        8,
+        activation="relu",
+        kernel_regularizer=regularizers.l2(5e-3),
+        bias_regularizer=regularizers.l2(5e-3),
+        name="static_dense2",
     )(s)
     s = BatchNormalization(name="static_bn2")(s)
-    s = Dropout(0.6, name="static_drop2")(s)
+    s = Dropout(0.7, name="static_drop2")(s)
 
-    # ─── Cross-Attention Fusion (Static queries Weather) ─────
-    s_query = Reshape((1, s.shape[-1]), name="expand_query")(s)             # (None, 1, 4)
-    fusion  = MultiHeadAttention(num_heads=4, key_dim=16, name="cross_attention")(s_query, x, x)  # (None, 1, d)
-    fusion  = GlobalAveragePooling1D(name="squeeze_fusion")(fusion)         # (None, d)
-    
-    # Weather pooling (max + mean)
-    x_max  = GlobalMaxPooling1D(name="time_max")(x)        # (None, D)
-    x_mean = GlobalAveragePooling1D(name="time_mean")(x)   # (None, D)
-    x_pooled= Concatenate(name="weather_pool_concat")([x_max, x_mean])
-    
-    
+    # Scale static contribution down so it behaves more like a small bias term
+    s = Lambda(lambda z: 0.3 * z, name="scale_static")(s)
 
-    # Concatenate fusion with pooled weather
-    fusion  = Concatenate(name="fusion_concat")([fusion, x_pooled])
+    # ─── Fusion & Dense Head ─────────────────────────────────
+    fusion = Concatenate(name="fusion_concat")([weather_repr, s])
 
-    # ─── Dense head ──────────────────────────────────────────
-    z = Dense(128, activation="relu", kernel_regularizer=regularizers.l2(1e-4), name="head_dense1")(fusion)
+    z = Dense(
+        128,
+        activation="relu",
+        kernel_regularizer=regularizers.l2(1e-4),
+        name="head_dense1",
+    )(fusion)
     z = BatchNormalization(name="head_bn1")(z)
     z = Dropout(0.4, name="head_drop1")(z)
 
-    z = Dense(64, activation="relu", kernel_regularizer=regularizers.l2(1e-4), name="head_dense2")(z)
+    z = Dense(
+        64,
+        activation="relu",
+        kernel_regularizer=regularizers.l2(1e-4),
+        name="head_dense2",
+    )(z)
     z = BatchNormalization(name="head_bn2")(z)
     z = Dropout(0.2, name="head_drop2")(z)
 
     main_out = Dense(1, name="main_out")(z)
 
-    # ─── Residual Weather Head ───────────────────────────────
-    aux_out  = Dense(1, use_bias=False, name="weather_residual")(x_pooled)
+    # ─── Weather-only Residual Head ──────────────────────────
+    # This gives the network a direct linear readout from weather,
+    # encouraging it to lean on weather features.
+    aux_out = Dense(
+        1,
+        use_bias=False,
+        kernel_regularizer=regularizers.l2(1e-4),
+        name="weather_residual",
+    )(weather_repr)
 
-    # Combine outputs
+    # Final prediction = main_head + weather-only residual
     final_out = Add(name="final_output")([main_out, aux_out])
 
-    return Model(inputs=[weather_input, static_input], outputs=final_out, name="senescence_model")
+    model = Model(
+        inputs=[weather_input, static_input],
+        outputs=final_out,
+        name="senescence_model_v2",
+    )
+    return model
+
 
 
 def save_model_diagram(model, out_path="plots/model_architecture.png"):
@@ -487,7 +587,16 @@ def evaluate_model(history, model, data_splits, args,
     plt.close()
 
     # Residuals
-    plot_residual_analysis(model, rolling_windows, args.weather_columns, target_scaler, args.static_columns, plot_dir)
+    plot_residual_analysis(
+    model,
+    rolling_windows,
+    args.weather_columns,
+    target_scaler,
+    args.static_columns,
+    plot_dir=plot_dir,
+    weather_scaler=weather_scaler,
+    static_scaler=static_scaler,
+    )
     print(f"[evaluate_model] Plots saved to '{plot_dir}/'")
 
 def evaluate_site_accuracy(model, rolling_windows, y_true, data_columns,
