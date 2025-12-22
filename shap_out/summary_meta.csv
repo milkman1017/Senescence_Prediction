@@ -1,0 +1,2 @@
+n_samples,time_steps,n_weather_features,n_static_features,explainer
+3000,10,8,6,kernel

@@ -264,6 +264,41 @@ def split_and_scale(X_weather, X_static, y, years, groups, holdout_year=2024):
     return (Xw_train_s, Xs_train_s, y_train_s, Xw_val_s, Xs_val_s, y_val_s,
             weather_scaler, static_scaler, target_scaler, train_idx, val_idx)
 
+def compute_weather_summaries(windows, weather_columns):
+    """
+    For each window, compute [mean, max, min, std, sum] for every weather feature.
+    Returns an array of shape (n_windows, len(weather_columns)*5).
+    """
+    stats_per_window = []
+    for w in windows:
+        arr = w[weather_columns].to_numpy(dtype=float)  # (T, F)
+        feats = []
+        # stats order: mean, max, min, std, sum
+        for j in range(arr.shape[1]):
+            v = arr[:, j]
+            feats.extend([
+                np.nanmean(v),
+                np.nanmax(v),
+                np.nanmin(v),
+                np.nanstd(v),
+                np.nansum(v),
+            ])
+        stats_per_window.append(feats)
+    return np.array(stats_per_window)
+
+
+def get_weather_summary_names(weather_columns):
+    """
+    Names for the summary features, in the same order as compute_weather_summaries.
+    """
+    stats = ['mean', 'max', 'min', 'std', 'sum']
+    names = []
+    for col in weather_columns:
+        for s in stats:
+            names.append(f"{col}_{s}")
+    return names
+
+
 
 
 def build_model(weather_input_shape, static_input_shape):
@@ -601,17 +636,31 @@ def evaluate_model(history, model, data_splits, args,
 
 def evaluate_site_accuracy(model, rolling_windows, y_true, data_columns,
                            target_scaler, static_columns, weather_scaler, static_scaler):
+    # Weather tensor (time series)
     X_weather = np.array([w[data_columns].values for w in rolling_windows])
-    X_static  = np.array([w.iloc[-1][static_columns].astype(float).values for w in rolling_windows])
 
-    # NEW: scale inputs
-    X_weather = weather_scaler.transform(X_weather.reshape(-1, X_weather.shape[-1])).reshape(X_weather.shape)
-    X_static  = static_scaler.transform(X_static)
+    # Base static from the last row in each window
+    base_static = np.array([
+        w.iloc[-1][static_columns].astype(float).values
+        for w in rolling_windows
+    ])
 
+    # Summary stats of weather over each window
+    weather_summaries = compute_weather_summaries(rolling_windows, data_columns)
+
+    # Full static = base static + summaries
+    X_static = np.hstack([base_static, weather_summaries])
+
+    # Scale inputs with training scalers
+    X_weather = weather_scaler.transform(
+        X_weather.reshape(-1, X_weather.shape[-1])
+    ).reshape(X_weather.shape)
+    X_static = static_scaler.transform(X_static)
+
+    # Predict (y_true is already in raw days)
     y_pred = model.predict([X_weather, X_static]).flatten()
     y_pred = target_scaler.inverse_transform(y_pred.reshape(-1, 1)).flatten()
 
-    # DO NOT inverse_transform y_true
     records = []
     for window_df, t, p in zip(rolling_windows, y_true, y_pred):
         site = window_df['Site'].iloc[0]
@@ -639,6 +688,7 @@ def evaluate_site_accuracy(model, rolling_windows, y_true, data_columns,
     plt.close()
 
     return site_mae
+
 
 def plot_site_mae(site_mae, categorical_decoders, plot_path='plots/site_mae.png'):
     """
@@ -669,16 +719,24 @@ def plot_residual_analysis(
     weather_scaler=None,
     static_scaler=None
 ):
-
-
-    # Build arrays
+    # Weather tensor
     X_weather = np.stack(
-        [w[weather_columns].to_numpy(dtype=float) for w in rolling_windows], axis=0
-    )  # shape: (n_samples, time, n_features)
-    X_static = np.stack(
+        [w[weather_columns].to_numpy(dtype=float) for w in rolling_windows],
+        axis=0
+    )  # (n_samples, T, F)
+
+    # Base static from last row
+    base_static = np.stack(
         [w.iloc[-1][static_columns].astype(float).to_numpy() for w in rolling_windows],
         axis=0
-    )  # shape: (n_samples, n_static)
+    )  # (n_samples, n_static_orig)
+
+    # Weather summaries over each window
+    weather_summaries = compute_weather_summaries(rolling_windows, weather_columns)
+    # Full static = base static + summaries (same dim as used in training)
+    X_static = np.hstack([base_static, weather_summaries])
+
+    # Targets in raw days
     y_true = np.array(
         [float(w["days_until_senescence"].iloc[-1]) for w in rolling_windows]
     )
@@ -761,12 +819,12 @@ def plot_residual_analysis(
         f.write("feature,pearson_r\n")
         for feat, r in corrs:
             if np.isnan(r):
-                # leave blank if correlation couldn't be computed
                 f.write(f"{feat},\n")
             else:
                 f.write(f"{feat},{r:.6f}\n")
 
     return out_png, corr_csv
+
 
 def main():
     args = parse_args()
@@ -775,17 +833,27 @@ def main():
     (val_2024_windows, val_2024_labels, val_2024_static, val_2024_years, val_2024_groups), \
     (categorical_encoders, categorical_decoders) = load_data(args)
 
-    # Convert training windows into arrays
+    # --- Build weather tensor ---
     X_weather = np.array([w[args.weather_columns].values for w in train_windows])
-    X_static = train_static
-    y = labels
 
+    # --- Build extended static: original static + window summaries ---
+    # base_static shape: (n_windows, n_static_orig)
+    base_static = train_static
+    # summaries shape: (n_windows, len(weather_columns)*5)
+    weather_summaries = compute_weather_summaries(train_windows, args.weather_columns)
+    # full static shape: (n_windows, n_static_orig + len(weather_columns)*5)
+    X_static = np.hstack([base_static, weather_summaries])
+
+    # Shapes for model inputs
     weather_shape = (args.time_interval, len(args.weather_columns))
-    static_shape = (len(args.static_columns),)
+    static_shape = (X_static.shape[1],)
+
+    # For artifacts: record names for both original static and summary features
+    summary_names = get_weather_summary_names(args.weather_columns)
+    full_static_column_names = args.static_columns + summary_names
 
     # Build and train final model
     strategy = tf.distribute.MirroredStrategy()
-    
 
     with strategy.scope():
         model = build_model(weather_shape, static_shape)
@@ -797,20 +865,39 @@ def main():
         save_model_diagram(model, out_path="plots/model_architecture.png")
 
     print(model.summary())
-    history, splits, scalers = train(model, X_weather, X_static, y, years, groups, holdout_year=2024)
+    history, splits, scalers = train(
+        model,
+        X_weather,
+        X_static,
+        labels,
+        years,
+        groups,
+        holdout_year=2024
+    )
     weather_scaler, static_scaler, target_scaler = scalers
+
+    # Prepare 2024 holdout data with the same static structure
+    if len(val_2024_windows) > 0:
+        Xw_2024 = np.array([w[args.weather_columns].values for w in val_2024_windows])
+        base_static_2024 = val_2024_static
+        weather_summaries_2024 = compute_weather_summaries(val_2024_windows, args.weather_columns)
+        Xs_2024 = np.hstack([base_static_2024, weather_summaries_2024])
+        val_2024_data = (Xw_2024, Xs_2024, val_2024_labels)
+    else:
+        val_2024_data = None
 
     artifacts = {
         "weather_columns": args.weather_columns,
-        "static_columns": args.static_columns,
+        # include original static names + summary feature names in the saved metadata
+        "static_columns": full_static_column_names,
         "time_interval": args.time_interval,
-        # label encoders from load_data()
-        "categorical_encoders": {k: {"classes_": v.classes_.tolist()} for k, v in categorical_encoders.items()}
+        "categorical_encoders": {k: {"classes_": v.classes_.tolist()}
+                                 for k, v in categorical_encoders.items()}
     }
     os.makedirs("models", exist_ok=True)
     dump({"weather_scaler": weather_scaler,
-        "static_scaler": static_scaler,
-        "target_scaler": target_scaler}, "models/scalers.joblib")
+          "static_scaler": static_scaler,
+          "target_scaler": target_scaler}, "models/scalers.joblib")
     with open("models/artifacts.json", "w") as f:
         json.dump(artifacts, f, indent=2)
 
@@ -824,9 +911,11 @@ def main():
 
     # Evaluate on train/val + 2024 holdout
     evaluate_model(
-        history, model, splits, args,
-        val_2024_data=(np.array([w[args.weather_columns].values for w in val_2024_windows]),
-                       val_2024_static, val_2024_labels) if len(val_2024_windows) > 0 else None,
+        history,
+        model,
+        splits,
+        args,
+        val_2024_data=val_2024_data,
         rolling_windows=train_windows,
         val_2024_windows=val_2024_windows,
         target_scaler=target_scaler,
@@ -834,11 +923,16 @@ def main():
         static_scaler=static_scaler
     )
 
-    # Site-level accuracy
+    # Site-level accuracy (needs the same static structure)
     site_acc_df = evaluate_site_accuracy(
-        model, train_windows, labels,
-        args.weather_columns, target_scaler, args.static_columns,
-        weather_scaler, static_scaler
+        model,
+        train_windows,
+        labels,
+        args.weather_columns,
+        target_scaler,
+        args.static_columns,  # base static names; function will append summaries
+        weather_scaler,
+        static_scaler
     )
     plot_site_mae(site_acc_df, categorical_decoders, plot_path='plots/site_mae.png')
     print("\n[main] Site-source accuracy:")

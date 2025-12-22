@@ -1,0 +1,11 @@
+feature,pearson_r
+growing_degree_hours,-0.010454
+frost_hours,0.006114
+day_length,0.001845
+tmin_x_min_sea,-0.011479
+daylen_x_tmin,-0.012446
+daylen_x_tmax,-0.006376
+frost_x_gdh,0.005458
+frost_x_daylen,0.007811
+doy_sin,0.007983
+doy_cos,0.000406
